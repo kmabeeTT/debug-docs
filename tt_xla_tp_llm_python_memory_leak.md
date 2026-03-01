@@ -3,7 +3,7 @@
 **Date**: 2026-03-01
 **Repo**: tt-xla
 **Branch**: kmabee/llms_in_galaxy_ci.testing
-**Fix commit**: 9eb04f3fa (tests/conftest.py)
+**Fix commit**: 9eb04f3fa (tests/conftest.py), 6e4b1801b (C++/test stability)
 
 ---
 
@@ -293,3 +293,150 @@ This is only active when `--log-memory` is explicitly passed; zero overhead othe
   becomes a no-op (safe but ineffective). Can add a version check or fallback if needed.
 - The `--forked` mode (`pytest-forked`) would also avoid this leak since each test
   runs in a subprocess, but has its own overhead and failure modes.
+
+---
+
+## Related Fixes Found During the Same Investigation
+
+These four issues were found and fixed in the same investigation pass (commit `6e4b1801b`).
+They are independent bugs but all surfaced through the same TP LLM test runs.
+
+### 1. C++ Program Cache Never Freed for Distributed Runtime
+
+**File**: `pjrt_implementation/src/api/loaded_executable_instance.cc`
+
+**Problem**: `LoadedExecutableInstance::~LoadedExecutableInstance()` guarded
+`clearProgramCache()` with:
+
+```cpp
+if (device && getCurrentHostRuntime() == HostRuntime::Local &&
+    isProgramCacheEnabled(*device)) {
+```
+
+For tensor-parallel (TP) models the runtime is distributed (`HostRuntime::Distributed`),
+not local. The `HostRuntime::Local` guard made the cache never cleared in the WORKER
+PROCESS across TP tests. This is a separate leak from the Python-level one — it affects
+the worker processes, not the test process.
+
+**Fix**: Remove the `getCurrentHostRuntime() == HostRuntime::Local &&` guard:
+
+```cpp
+if (device && isProgramCacheEnabled(*device)) {
+```
+
+**Note**: This leak was discovered via `smaps` analysis of the worker process (separate
+from the test process analysis). The C++ program cache stores compiled flatbuffer binaries
+in device memory; without clearing it, memory usage in the worker process grows with each
+new model compiled.
+
+---
+
+### 2. MLIR Context Accumulates BumpPtrAllocator Memory Across Compilations
+
+**Files**: `pjrt_implementation/src/api/module_builder/module_builder.cc`,
+`pjrt_implementation/inc/api/module_builder/module_builder.h`,
+`pjrt_implementation/src/api/client_instance.cc`
+
+**Problem**: `ModuleBuilder` holds a single `mlir::MLIRContext` that lives for the entire
+lifetime of the client. Each call to `buildModule()` runs the full VHLO→SHLO→TTIR→TTNN
+compilation pipeline through MLIR pass managers. MLIR's internal `BumpPtrAllocator` (used
+for IR storage) cannot free individual allocations — memory is only released when the
+context is destroyed. Over multiple model compilations, this accumulates.
+
+**Fix**: Added `ModuleBuilder::resetContext()`, which destroys and recreates the
+`MLIRContext`, releasing all bump-allocated IR:
+
+```cpp
+void ModuleBuilder::resetContext() {
+  m_context = std::make_unique<mlir::MLIRContext>();
+  registerDialectsInContext(*m_context);
+}
+```
+
+Called from `ClientInstance::compileMlirProgram()` immediately after `buildModule()` returns
+(after all `OwningOpRef` locals are destroyed, which is important — `OwningOpRef` destructs
+release IR into the context's allocator, and the context must outlive them):
+
+```cpp
+auto [status, image] = m_module_builder->buildModule(...);
+m_module_builder->resetContext();  // free BumpPtrAllocator
+```
+
+Also extracted `registerDialectsInContext(mlir::MLIRContext&)` as a static helper so
+dialect registration is consistent between the constructor and `resetContext()`.
+
+**Note**: Size logging was also added (`compileMlirProgram: mlir_code size = X.Y MB`) to
+make it easy to see how large each compilation's input is.
+
+---
+
+### 3. SIGABRT After Test Failure from XLA Runtime Re-entry
+
+**Files**: `tests/runner/test_models.py`, `tests/runner/test_utils.py`
+
+**Problem**: `test_all_models_torch` calls `get_xla_device_arch()` inside a `finally`
+block for performance benchmarking setup. If the test had already failed and the device
+was in a bad state (closed or partially torn down), calling
+`xr.global_runtime_device_attributes()` inside `get_xla_device_arch()` caused a SIGABRT
+in the worker process — which killed the entire test runner.
+
+Two separate sub-problems:
+
+**3a. Perf benchmarking runs even on failure**
+```python
+# Before:
+if framework == Framework.TORCH and run_mode == RunMode.INFERENCE:
+    # runs on both pass and fail paths
+
+# After:
+if framework == Framework.TORCH and run_mode == RunMode.INFERENCE and succeeded:
+    # only runs when the test actually passed
+```
+
+**3b. `get_xla_device_arch()` called repeatedly, re-entering XLA runtime each time**
+
+`get_xla_device_arch()` in `test_utils.py` called `xr.global_runtime_device_attributes()`
+on every invocation. Added module-level caching so XLA is only queried once:
+
+```python
+_cached_device_arch: Optional[str] = None
+
+def get_xla_device_arch():
+    global _cached_device_arch
+    if _cached_device_arch is not None:
+        return _cached_device_arch
+    # ... existing arch detection logic ...
+    _cached_device_arch = arch
+    return _cached_device_arch
+```
+
+This also eliminates redundant runtime queries across multiple tests in the same session.
+
+---
+
+### 4. Explicit Model Object Cleanup After Each Test
+
+**File**: `tests/runner/test_models.py`
+
+**Problem**: After each test, the `tester` object (and its `_workload`) held references to
+the model, compiled executable, and input tensors. Python reference counting wouldn't free
+these until the tester object itself was GC'd, which might not happen promptly — especially
+if the reference cycle around the GraphModule (described in the main fix above) prevented
+timely cleanup.
+
+**Fix**: Explicit null-out in the `finally` block:
+
+```python
+if tester is not None:
+    if getattr(tester, "_workload", None) is not None:
+        tester._workload.model = None
+        tester._workload.compiled_executable = None
+        tester._workload.args = []
+        tester._workload.kwargs = {}
+        tester._workload.shard_spec_fn = None
+    tester._model = None
+    tester._input_activations = None
+```
+
+This breaks the reference chain from the tester → model weights promptly after each test,
+complementing the `sym_constants_to_graph_vars` cleanup in conftest.py.
