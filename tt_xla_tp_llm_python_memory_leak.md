@@ -198,53 +198,36 @@ references only; `sym_constants_to_graph_vars` still holds the primary reference
 
 ## The Fix
 
-In `tests/conftest.py`, `run_around_tests` fixture teardown, after `torch._dynamo.reset()`:
+In `tests/conftest.py`, a `_release_dynamo_bridge_tensors()` function is called from
+`run_around_tests` fixture teardown, after `torch._dynamo.reset()`:
 
 ```python
-import types as _types
+def _release_dynamo_bridge_tensors():
+    """Workaround for torch_xla leak: after torch._dynamo.reset(), GraphInputMatcher
+    objects and their parent caches survive, holding all model-weight XLA tensors
+    (~26 GB for 8B TP). We find these by type and clear their parent dicts.
+    """
+    from torch_xla._dynamo.dynamo_bridge import GraphInputMatcher
 
-# 1. Clear sym_constants_to_graph_vars in every live optimized_mod closure
-try:
     for obj in gc.get_objects():
-        if (
-            isinstance(obj, _types.FunctionType)
-            and obj.__qualname__ == "extract_internal.<locals>.optimized_mod"
-            and obj.__closure__
-        ):
-            for i, varname in enumerate(obj.__code__.co_freevars):
-                cell = obj.__closure__[i]
-                try:
-                    val = cell.cell_contents
-                except ValueError:
-                    continue
-                if varname == "sym_constants_to_graph_vars" and isinstance(val, dict):
-                    val.clear()   # releases GraphInputMatcher → 26 GB XLA tensors
-                elif varname == "xla_model" and hasattr(val, "xla_args"):
-                    val.xla_args = None   # releases cached input tensors
-except Exception:
-    pass
-
-# 2. Belt-and-suspenders: clear node.meta on all live GraphModules
-try:
-    import torch.fx as _torch_fx
-    for obj in gc.get_objects():
-        if isinstance(obj, _torch_fx.GraphModule):
-            try:
-                for node in obj.graph.nodes:
-                    node.meta.clear()
-            except Exception:
-                pass
-except Exception:
-    pass
-
-gc.collect()
+        if isinstance(obj, torch.fx.GraphModule):
+            if getattr(obj, "xla_args", None) is not None:
+                obj.xla_args = None
+        if isinstance(obj, GraphInputMatcher):
+            for ref in gc.get_referrers(obj):
+                if isinstance(ref, tuple):
+                    for d in gc.get_referrers(ref):
+                        if isinstance(d, dict):
+                            d.clear()
 ```
 
 **How it works**:
-- Scans all Python objects for functions named `extract_internal.<locals>.optimized_mod`
-- Accesses closure variables by name via `__code__.co_freevars` + `__closure__`
-- Clears `sym_constants_to_graph_vars` dict in-place (frees all cached GraphInputMatcher objects)
-- `GraphInputMatcher.graph_input_xla_values` is released → 1091 XLA tensors freed → 26 GB reclaimed
+- Imports `GraphInputMatcher` class from torch_xla for type-safe matching (no string matching)
+- Scans all Python objects for live `GraphInputMatcher` instances
+- Traces referrers: `GraphInputMatcher` ← `tuple` ← `dict` (the `sym_constants_to_graph_vars` cache)
+- Clears each parent dict, releasing all cached GraphInputMatcher objects and their XLA tensors
+- Also clears `xla_args` on surviving `GraphModule` objects (cached input tensors that pin model weights)
+- `gc.collect()` in the existing `memory_usage_tracker` fixture handles cycle collection
 
 **Results**:
 
@@ -288,9 +271,8 @@ This is only active when `--log-memory` is explicitly passed; zero overhead othe
 - This is distinct from the C++ program cache leak (separate fix in
   `loaded_executable_instance.cc`) — that leak affects the WORKER process (distributed
   runtime), while this leak affects the TEST PROCESS.
-- The `optimized_mod.__qualname__` check is specific to the torch_xla version in use.
-  If torch_xla is upgraded and the internal function is renamed, the cleanup silently
-  becomes a no-op (safe but ineffective). Can add a version check or fallback if needed.
+- The fix uses `isinstance(obj, GraphInputMatcher)` for type-safe matching. If torch_xla
+  renames or removes this class, the import will fail loudly rather than silently no-op.
 - The `--forked` mode (`pytest-forked`) would also avoid this leak since each test
   runs in a subprocess, but has its own overhead and failure modes.
 
