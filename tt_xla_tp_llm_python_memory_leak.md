@@ -2,17 +2,16 @@
 
 **Date**: 2026-03-01
 **Repo**: tt-xla
-**Branch**: kmabee/llms_in_galaxy_ci.testing
-**Fix commit**: 9eb04f3fa (tests/conftest.py), 6e4b1801b (C++/test stability)
+**PR**: #3521
 
 ---
 
 ## Problem
 
-Sequential tensor-parallel (TP) LLM tests accumulate ~26 GB of host RAM per large model
-test in the test process. The memory is NOT released between tests, causing OOM
-on machines with limited RAM when running multiple TP models sequentially (e.g. Qwen3-8B
-followed by Qwen3-14B).
+Sequential tensor-parallel (TP) LLM tests accumulate host RAM proportional to model size
+per test in the test process. The memory is NOT released between tests, causing OOM
+when running multiple TP models sequentially (e.g. ~258 GB retained after GPT-OSS-120B
+on Galaxy, ~26 GB after Qwen3-8B on N300).
 
 **None of these helped:**
 - `gc.collect()` — Python garbage collector
@@ -194,6 +193,22 @@ gc.collect()
 `GraphInputMatcher.graph_input_xla_values`. Clearing node.meta releases secondary
 references only; `sym_constants_to_graph_vars` still holds the primary references.
 
+### Attempt 2: clear only GraphInputMatcher.graph_input_xla_values
+
+```python
+from torch_xla._dynamo.dynamo_bridge import GraphInputMatcher
+for obj in gc.get_objects():
+    if isinstance(obj, GraphInputMatcher) and obj.graph_input_xla_values:
+        obj.graph_input_xla_values.clear()
+```
+
+**Result**: RSS stayed at 26,824 MB.
+
+**Why it didn't work**: Clearing the tensor list inside each matcher is not enough.
+The parent `sym_constants_to_graph_vars` dict must be cleared entirely — other entries
+in the cached tuple (e.g. `args_and_out`) also hold tensor references. Additionally,
+`xla_model.xla_args` on the captured GraphModule pins model weights independently.
+
 ---
 
 ## The Fix
@@ -231,12 +246,12 @@ def _release_dynamo_bridge_tensors():
 
 **Results**:
 
-| Metric | Before fix | After fix |
-|--------|-----------|-----------|
-| RSS after 8B TP test | 26,824 MB | 1,758 MB |
-| RSS after 0.6B TP test | 2,794 MB | 1,627 MB |
-| Heap (smaps) after 8B | 13,785 MB | 484 MB |
-| 9.5 GB anon mmap | present | gone |
+Galaxy (32-chip) — GPT-OSS-120B followed by Llama-3.1-70B:
+- Process RSS after GPT-OSS-120B cleanup: 257,829 MB → 30,625 MB
+- System free at Llama-70B start: 204,532 MB → 432,060 MB
+
+N300 (2-chip) — Qwen3-8B TP:
+- Process RSS after cleanup: ~27,000 MB → ~1,600 MB
 
 ---
 
@@ -248,177 +263,24 @@ def _release_dynamo_bridge_tensors():
 
 ---
 
-## Diagnostic Infrastructure Added
+## Diagnostic Changes
 
-The `memory_usage_tracker` fixture in `tests/conftest.py` now writes to
-`/tmp/mem_diag_<pid>.log` when `--log-memory` is passed:
-
-- Live CPU tensor sizes (total + large tensors)
-- Live XLA/non-CPU tensor sizes (total + large tensors with device/shape/dtype)
-- Referrer tracing for top-3 largest XLA tensors (2 levels deep)
-- Live `torch.fx.GraphModule` count + closures holding them
-- Live `XLAExecutor` count + referrers
-- Live `torch.nn.Module` count + param counts
-- `smaps_rollup` breakdown (Rss, Private_Dirty, Anonymous, etc.)
-- Top-15 smaps regions by RSS
-
-This is only active when `--log-memory` is explicitly passed; zero overhead otherwise.
+The `memory_usage_tracker` fixture in `tests/conftest.py` now includes process RSS
+in its `--log-memory` output at both sampling positions (after test, after gc).
 
 ---
 
 ## Notes
 
-- This is distinct from the C++ program cache leak (separate fix in
-  `loaded_executable_instance.cc`) — that leak affects the WORKER process (distributed
-  runtime), while this leak affects the TEST PROCESS.
+- This is a workaround, not a proper fix. The proper fix is for torch_xla's `openxla`
+  backend to implement a `reset()` method so `torch._dynamo.reset()` can notify it to
+  clean up. Dynamo already calls `backend.reset()` via `_reset_guarded_backend_cache()`,
+  but the `openxla` backend is a bare `aot_autograd` partial with no `reset()` method.
 - The fix uses `isinstance(obj, GraphInputMatcher)` for type-safe matching. If torch_xla
   renames or removes this class, the import will fail loudly rather than silently no-op.
+- There is also a separate C++ program cache leak in the worker process (distributed
+  runtime) — `LoadedExecutableInstance::~LoadedExecutableInstance()` guards
+  `clearProgramCache` with `HostRuntime::Local`, so the cache is never cleared for TP.
+  This is tracked separately.
 - The `--forked` mode (`pytest-forked`) would also avoid this leak since each test
   runs in a subprocess, but has its own overhead and failure modes.
-
----
-
-## Related Fixes Found During the Same Investigation
-
-These four issues were found and fixed in the same investigation pass (commit `6e4b1801b`).
-They are independent bugs but all surfaced through the same TP LLM test runs.
-
-### 1. C++ Program Cache Never Freed for Distributed Runtime
-
-**File**: `pjrt_implementation/src/api/loaded_executable_instance.cc`
-
-**Problem**: `LoadedExecutableInstance::~LoadedExecutableInstance()` guarded
-`clearProgramCache()` with:
-
-```cpp
-if (device && getCurrentHostRuntime() == HostRuntime::Local &&
-    isProgramCacheEnabled(*device)) {
-```
-
-For tensor-parallel (TP) models the runtime is distributed (`HostRuntime::Distributed`),
-not local. The `HostRuntime::Local` guard made the cache never cleared in the WORKER
-PROCESS across TP tests. This is a separate leak from the Python-level one — it affects
-the worker processes, not the test process.
-
-**Fix**: Remove the `getCurrentHostRuntime() == HostRuntime::Local &&` guard:
-
-```cpp
-if (device && isProgramCacheEnabled(*device)) {
-```
-
-**Note**: This leak was discovered via `smaps` analysis of the worker process (separate
-from the test process analysis). The C++ program cache stores compiled flatbuffer binaries
-in device memory; without clearing it, memory usage in the worker process grows with each
-new model compiled.
-
----
-
-### 2. MLIR Context Accumulates BumpPtrAllocator Memory Across Compilations
-
-**Files**: `pjrt_implementation/src/api/module_builder/module_builder.cc`,
-`pjrt_implementation/inc/api/module_builder/module_builder.h`,
-`pjrt_implementation/src/api/client_instance.cc`
-
-**Problem**: `ModuleBuilder` holds a single `mlir::MLIRContext` that lives for the entire
-lifetime of the client. Each call to `buildModule()` runs the full VHLO→SHLO→TTIR→TTNN
-compilation pipeline through MLIR pass managers. MLIR's internal `BumpPtrAllocator` (used
-for IR storage) cannot free individual allocations — memory is only released when the
-context is destroyed. Over multiple model compilations, this accumulates.
-
-**Fix**: Added `ModuleBuilder::resetContext()`, which destroys and recreates the
-`MLIRContext`, releasing all bump-allocated IR:
-
-```cpp
-void ModuleBuilder::resetContext() {
-  m_context = std::make_unique<mlir::MLIRContext>();
-  registerDialectsInContext(*m_context);
-}
-```
-
-Called from `ClientInstance::compileMlirProgram()` immediately after `buildModule()` returns
-(after all `OwningOpRef` locals are destroyed, which is important — `OwningOpRef` destructs
-release IR into the context's allocator, and the context must outlive them):
-
-```cpp
-auto [status, image] = m_module_builder->buildModule(...);
-m_module_builder->resetContext();  // free BumpPtrAllocator
-```
-
-Also extracted `registerDialectsInContext(mlir::MLIRContext&)` as a static helper so
-dialect registration is consistent between the constructor and `resetContext()`.
-
-**Note**: Size logging was also added (`compileMlirProgram: mlir_code size = X.Y MB`) to
-make it easy to see how large each compilation's input is.
-
----
-
-### 3. SIGABRT After Test Failure from XLA Runtime Re-entry
-
-**Files**: `tests/runner/test_models.py`, `tests/runner/test_utils.py`
-
-**Problem**: `test_all_models_torch` calls `get_xla_device_arch()` inside a `finally`
-block for performance benchmarking setup. If the test had already failed and the device
-was in a bad state (closed or partially torn down), calling
-`xr.global_runtime_device_attributes()` inside `get_xla_device_arch()` caused a SIGABRT
-in the worker process — which killed the entire test runner.
-
-Two separate sub-problems:
-
-**3a. Perf benchmarking runs even on failure**
-```python
-# Before:
-if framework == Framework.TORCH and run_mode == RunMode.INFERENCE:
-    # runs on both pass and fail paths
-
-# After:
-if framework == Framework.TORCH and run_mode == RunMode.INFERENCE and succeeded:
-    # only runs when the test actually passed
-```
-
-**3b. `get_xla_device_arch()` called repeatedly, re-entering XLA runtime each time**
-
-`get_xla_device_arch()` in `test_utils.py` called `xr.global_runtime_device_attributes()`
-on every invocation. Added module-level caching so XLA is only queried once:
-
-```python
-_cached_device_arch: Optional[str] = None
-
-def get_xla_device_arch():
-    global _cached_device_arch
-    if _cached_device_arch is not None:
-        return _cached_device_arch
-    # ... existing arch detection logic ...
-    _cached_device_arch = arch
-    return _cached_device_arch
-```
-
-This also eliminates redundant runtime queries across multiple tests in the same session.
-
----
-
-### 4. Explicit Model Object Cleanup After Each Test
-
-**File**: `tests/runner/test_models.py`
-
-**Problem**: After each test, the `tester` object (and its `_workload`) held references to
-the model, compiled executable, and input tensors. Python reference counting wouldn't free
-these until the tester object itself was GC'd, which might not happen promptly — especially
-if the reference cycle around the GraphModule (described in the main fix above) prevented
-timely cleanup.
-
-**Fix**: Explicit null-out in the `finally` block:
-
-```python
-if tester is not None:
-    if getattr(tester, "_workload", None) is not None:
-        tester._workload.model = None
-        tester._workload.compiled_executable = None
-        tester._workload.args = []
-        tester._workload.kwargs = {}
-        tester._workload.shard_spec_fn = None
-    tester._model = None
-    tester._input_activations = None
-```
-
-This breaks the reference chain from the tester → model weights promptly after each test,
-complementing the `sym_constants_to_graph_vars` cleanup in conftest.py.
