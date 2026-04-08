@@ -91,7 +91,7 @@ Results with this change on n300_llmbox:
 
 ### Outstanding Issues
 
-1. **n300 compile crash (BLOCKER):** `reshape.138` sharding propagation failure. Needs fix in tt-mlir — the sharding propagation pass needs the same "look through reshape chains from rank-0 inputs" treatment that the fusing patterns got in PR #7777. Stefan Gligorijevic has context to pick this up.
+1. **n300 compile crash (NOT a CI blocker):** `reshape.138` sharding propagation failure. Only reproduces when running the n300 (2-chip TP) model config on n300_llmbox (4-chip) hardware — a config no CI test exercises. CI n300 tests pass on actual n300 hardware. Still worth tracking as a known issue — the sharding propagation pass may need similar handling for reshaped scalar constants as was done for the fusing patterns in PR #7777. Stefan Gligorijevic has context.
 
 2. **`--enable-aggressive-simplification=false`** is available as a runtime escape hatch if needed. It's a CLI flag, no rebuild required.
 
