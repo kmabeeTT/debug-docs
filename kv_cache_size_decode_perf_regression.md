@@ -1,8 +1,14 @@
-# KV Cache Size Causes Decode Performance Regression
+# KV Cache Size Causes Decode Performance Regression (FIXED)
 
-## Summary
+## Status: FIXED
 
-Increasing `gpu_memory_utilization` (which allocates more KV cache blocks) causes a proportional slowdown in decode tok/s, even when actual sequence length is short. This is a bug — unused allocated blocks should not affect decode speed.
+**Fix:** [vLLM] Split KV cache into separate K/V tensors to fix decode perf regression ([#4209](https://github.com/tenstorrent/tt-xla/pull/4209)), merged 2026-04-11.
+
+**Root cause:** KV cache was stored as a single interleaved tensor. Larger allocations meant more data movement per decode step even for short sequences. Splitting into separate K and V tensors resolved the scaling issue.
+
+## Original Summary
+
+Increasing `gpu_memory_utilization` (which allocates more KV cache blocks) caused a proportional slowdown in decode tok/s, even when actual sequence length was short.
 
 ## Evidence
 
